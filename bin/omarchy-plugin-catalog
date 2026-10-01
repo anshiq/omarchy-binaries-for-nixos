@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+
+# NixOS port of Omarchy's omarchy-plugin-catalog.
+# Origin: ./omarchy/bin/omarchy-plugin-catalog
+# Changes:
+# - Walks $NIX_QUICKSHELL_SOURCE_DIR (default /etc/nixos/quickshell/plugins,
+#   the declarative checkout deployed by desktop/home.nix) instead of
+#   $OMARCHY_PATH/shell/plugins, and $NIX_QUICKSHELL_PLUGINS_DIR (default
+#   ~/.config/quickshell/plugins, the live config dir PluginRow.qml reads)
+#   instead of ~/.config/omarchy/plugins.
+# - Guards both roots with [[ -d ]] (on this machine the config dir is an
+#   out-of-store symlink into the checkout, so both walks may hit the same
+#   files; unique_by(.id) below already dedupes that).
+# - The jq projection is verbatim: same single source of truth shape
+#   (id/name/description/kinds/firstParty/manifestPath/sourceDir/
+#   entryPoints/barWidget/bar/barWidgetPath/barPath).
+
+set -o pipefail
+
+# Sibling-dir resolution so the ported commands call each other without
+# needing this bin/ on PATH (upstream calls bare `omarchy-plugin-*`).
+BINDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+BUILTIN_DIR="${NIX_QUICKSHELL_SOURCE_DIR:-/etc/nixos/quickshell/plugins}"
+USER_DIR="${NIX_QUICKSHELL_PLUGINS_DIR:-$HOME/.config/quickshell/plugins}"
+
+paths=()
+
+if [[ -d $BUILTIN_DIR ]]; then
+  while IFS= read -r manifest; do
+    paths+=("$manifest")
+  done < <(find "$BUILTIN_DIR" -mindepth 2 -maxdepth 4 -type f \( -name manifest.json -o -name '*.manifest.json' \) 2>/dev/null | sort)
+fi
+
+user_dir="$USER_DIR"
+if [[ -d $user_dir ]]; then
+  while IFS= read -r manifest; do
+    paths+=("$manifest")
+  done < <(find -L "$user_dir" -mindepth 2 -maxdepth 2 -type f -name manifest.json \
+    ! -path "$user_dir/.*/*" 2>/dev/null | sort)
+fi
+
+if (( ${#paths[@]} == 0 )); then
+  echo "[]"
+  exit 0
+fi
+
+jq -n '
+  [ inputs
+    | . as $manifest
+    | input_filename as $manifestPath
+    | ($manifestPath | sub("/manifest.json$"; "") | sub("/[^/]+\\.manifest\\.json$"; "")) as $sourceDir
+    | {
+        id: ($manifest.id // ""),
+        name: ($manifest.name // $manifest.id // ""),
+        description: ($manifest.description // ""),
+        kinds: ($manifest.kinds // []),
+        firstParty: (($manifest.id // "") | startswith("omarchy.")),
+        manifestPath: $manifestPath,
+        sourceDir: $sourceDir,
+        entryPoints: ($manifest.entryPoints // {}),
+        barWidget: ($manifest.barWidget // null),
+        bar: ($manifest.bar // null)
+      }
+    | .barWidgetPath = (
+        if (.entryPoints.barWidget // null) != null
+        then (.sourceDir + "/" + .entryPoints.barWidget)
+        else null end)
+    | .barPath = (
+        if (.entryPoints.bar // null) != null
+        then (.sourceDir + "/" + .entryPoints.bar)
+        else null end)
+    | select(.id != "")
+  ]
+  | unique_by(.id)
+' "${paths[@]}"

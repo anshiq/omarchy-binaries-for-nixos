@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+
+# NixOS port of Omarchy's omarchy-plugin-enable.
+# Origin: ./omarchy/bin/omarchy-plugin-enable
+# Changes:
+# - `omarchy-shell shell enablePlugin` IPC replaced by editing $LAYOUT_FILE
+#   (~/.config/quickshell/plugin-layout.json) with jq: drop the id from
+#   every section, then insert into the target section (append, or at
+#   --index / --before / --after). Bar.qml hot-reloads the file, so no
+#   rescan/restart is needed.
+# - Plugin knowledge comes from the sibling omarchy-plugin-catalog instead
+#   of the shell daemon.
+# - Empty placement defaults to the manifest's barWidget.defaultSection (or
+#   legacy `section`), else "right" -- same default as
+#   quickshell/scripts/plugin.sh -- instead of leaving placement to the
+#   shell.
+
+set -euo pipefail
+
+BINDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAYOUT_FILE="${NIX_QUICKSHELL_LAYOUT_FILE:-$HOME/.config/quickshell/plugin-layout.json}"
+
+fail() {
+  echo "omarchy-plugin-enable: $*" >&2
+  exit 1
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  echo "Usage: omarchy plugin enable <id> [placement]"
+  exit 0
+fi
+
+id="${1:-}"
+[[ -n $id ]] || fail "plugin id is required"
+shift
+
+if (( $# > 0 )) && "$BINDIR/omarchy-plugin-catalog" | jq -e --arg id "$id" '
+  any(.[]; .id == $id and (.kinds | index("bar")))
+' >/dev/null; then
+  fail "'$id' is a bar; it replaces the bar in use rather than taking a place in one"
+fi
+
+section=""
+index=""
+before=""
+after=""
+if (( $# > 0 )) && [[ $1 != --* ]]; then
+  section="$1"
+  shift
+fi
+while (( $# > 0 )); do
+  case "$1" in
+    --section)
+      [[ -z $section ]] || fail "specify a section positionally or with --section, not both"
+      section="${2:-}"
+      [[ -n $section ]] || fail "--section requires a section"
+      shift 2
+      ;;
+    --index)
+      index="${2:-}"
+      [[ -n $index ]] || fail "--index requires an index"
+      shift 2
+      ;;
+    --before)
+      before="${2:-}"
+      [[ -n $before ]] || fail "--before requires a widget id"
+      shift 2
+      ;;
+    --after)
+      after="${2:-}"
+      [[ -n $after ]] || fail "--after requires a widget id"
+      shift 2
+      ;;
+    *)
+      fail "unknown placement option: $1"
+      ;;
+  esac
+done
+
+[[ -z $section || $section =~ ^(left|center|right)$ ]] ||
+  fail "section must be left, center, or right"
+[[ -z $index || $index =~ ^[0-9]+$ ]] ||
+  fail "index must be a non-negative integer"
+[[ -z $before || -z $after ]] || fail "use only one of --before or --after"
+
+catalog=$("$BINDIR/omarchy-plugin-catalog")
+if ! jq -e --arg id "$id" 'any(.[]; .id == $id)' <<<"$catalog" >/dev/null; then
+  fail "plugin '$id' is not known"
+fi
+
+if [[ -z $section ]]; then
+  section=$(jq -r --arg id "$id" '
+    map(select(.id == $id))[0]
+    | .barWidget.defaultSection // empty
+  ' <<<"$catalog")
+  if [[ -z $section ]]; then
+    manifest_dir=$(jq -r --arg id "$id" 'map(select(.id == $id))[0].sourceDir // empty' <<<"$catalog")
+    if [[ -n $manifest_dir && -f $manifest_dir/manifest.json ]]; then
+      section=$(jq -r '.section // empty' "$manifest_dir/manifest.json")
+    fi
+  fi
+  section="${section:-right}"
+fi
+
+mkdir -p "$(dirname "$LAYOUT_FILE")"
+if [[ ! -f $LAYOUT_FILE ]]; then
+  echo '{"left":[],"center":[],"right":[]}' >"$LAYOUT_FILE"
+fi
+
+tmp=$(mktemp)
+jq --arg id "$id" --arg section "$section" --arg index "$index" \
+  --arg before "$before" --arg after "$after" '
+  with_entries(.value |= map(select(. != $id)))
+  | .[$section] as $col
+  | .[$section] = (
+      if $index != "" then
+        ($index | tonumber) as $i
+        | $col[0:$i] + [$id] + $col[$i:]
+      elif $before != "" then
+        ($col | index($before)) as $i
+        | if $i == null then $col + [$id]
+          else $col[0:$i] + [$id] + $col[$i:] end
+      elif $after != "" then
+        ($col | index($after)) as $i
+        | if $i == null then $col + [$id]
+          else $col[0:$i + 1] + [$id] + $col[$i + 1:] end
+      else
+        $col + [$id]
+      end
+    )
+' "$LAYOUT_FILE" >"$tmp"
+mv "$tmp" "$LAYOUT_FILE"
+
+if jq -e --arg id "$id" 'any(.[]; .id == $id and (.kinds | index("bar")))' <<<"$catalog" >/dev/null; then
+  echo "Now using $id as the bar"
+else
+  echo "Enabled $id in $section"
+fi

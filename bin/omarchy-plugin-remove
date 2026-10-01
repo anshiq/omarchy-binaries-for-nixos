@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+
+# NixOS port of Omarchy's omarchy-plugin-remove.
+# Origin: ./omarchy/bin/omarchy-plugin-remove (alias: omarchy plugin rm)
+# Changes:
+# - PLUGINS_DIR -> $NIX_QUICKSHELL_PLUGINS_DIR (default
+#   ~/.config/quickshell/plugins).
+# - `gum confirm/choose` -> plain `read` prompts (gum is not packaged here).
+# - `omarchy-shell shell listPlugins` -> enabled check against $LAYOUT_FILE.
+# - `omarchy-shell shell setPluginEnabled/rescanPlugins` -> sibling
+#   omarchy-plugin-disable call / no-op (file watchers hot-reload).
+# - Also drops the id from $LAYOUT_FILE (via disable) and removes a
+#   matching `origin == "manual"` row from $REGISTRY_FILE when present.
+#   Generated registry rows are never touched: the next
+#   `nixos-rebuild switch` regenerates them.
+# - Symlink / git-checkout / hand-made-folder branches kept verbatim
+#   (unlink / delete / timestamped backup).
+
+set -euo pipefail
+
+BINDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+PLUGINS_DIR="${NIX_QUICKSHELL_PLUGINS_DIR:-$HOME/.config/quickshell/plugins}"
+LAYOUT_FILE="${NIX_QUICKSHELL_LAYOUT_FILE:-$HOME/.config/quickshell/plugin-layout.json}"
+REGISTRY_FILE="${NIX_QUICKSHELL_REGISTRY_FILE:-$HOME/.config/quickshell/plugin-registry.json}"
+ASSUME_YES=0
+
+fail() {
+  echo "omarchy-plugin-remove: $*" >&2
+  exit 1
+}
+
+interactive() {
+  [[ -t 0 && -t 1 ]]
+}
+
+confirm() {
+  local prompt="$1"
+  (( ASSUME_YES )) && return 0
+  if interactive; then
+    local answer
+    read -r -p "$prompt [y/N] " answer
+    [[ $answer == [yY] || $answer == [yY]es ]]
+  else
+    fail "refusing to continue without confirmation; pass --yes"
+  fi
+}
+
+valid_plugin_id() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $1 != *..* ]]
+}
+
+id=""
+
+while (( $# > 0 )); do
+  case "$1" in
+  --yes | -y)
+    ASSUME_YES=1
+    shift
+    ;;
+  -h | --help)
+    echo "Usage: omarchy plugin remove [id] [--yes]"
+    exit 0
+    ;;
+  -*)
+    fail "unknown remove option: $1"
+    ;;
+  *)
+    [[ -z $id ]] || fail "unexpected argument: $1"
+    id="$1"
+    shift
+    ;;
+  esac
+done
+
+[[ -d $PLUGINS_DIR ]] || fail "no plugins installed"
+
+if [[ -z $id ]]; then
+  interactive || fail "a plugin-id is required"
+  mapfile -t choices < <(find "$PLUGINS_DIR" -mindepth 1 -maxdepth 1 \( -type d -o -type l \) \
+    ! -name '.*' -printf '%f\n' 2>/dev/null | sort)
+  (( ${#choices[@]} > 0 )) || fail "no plugins installed"
+  echo "Installed plugins:" >&2
+  for i in "${!choices[@]}"; do
+    printf '  %d) %s\n' "$((i + 1))" "${choices[$i]}" >&2
+  done
+  read -r -p "Remove which plugin? [number] " pick
+  [[ $pick =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#choices[@]} )) ||
+    fail "cancelled"
+  id="${choices[$((pick - 1))]}"
+  [[ -n $id ]] || fail "nothing selected"
+fi
+valid_plugin_id "$id" || fail "invalid plugin id '$id'"
+
+target="$PLUGINS_DIR/$id"
+[[ -e $target || -L $target ]] || fail "plugin '$id' is not installed"
+
+was_enabled=""
+if [[ -f $LAYOUT_FILE ]]; then
+  if jq -e --arg id "$id" '
+    [.left, .center, .right] | add | index($id) != null
+  ' "$LAYOUT_FILE" >/dev/null 2>&1; then
+    was_enabled="true"
+  fi
+fi
+
+cloned_from=""
+if [[ -f $target/manifest.json ]]; then
+  cloned_from=$(jq -r '.omarchy.clonedFrom // empty' "$target/manifest.json")
+fi
+
+if [[ -L $target ]]; then
+  confirm "Unlink '$id' (symlink -> $(readlink "$target"))?" || fail "aborted"
+elif [[ -d $target/.git ]]; then
+  confirm "Delete '$id'? Its git repo remains upstream." || fail "aborted"
+else
+  confirm "Remove '$id'? The folder will be backed up." || fail "aborted"
+fi
+
+if [[ $was_enabled == "true" ]]; then
+  "$BINDIR/omarchy-plugin-disable" "$id" >/dev/null
+fi
+
+if [[ -L $target ]]; then
+  rm -f "$target"
+  echo "Unlinked $id."
+elif [[ -d $target/.git ]]; then
+  rm -rf "$target"
+  echo "Removed $id."
+else
+  base="$PLUGINS_DIR/.${id}.bak.$(date -u +%Y%m%d%H%M%S)"
+  backup="$base"
+  n=1
+  while [[ -e $backup ]]; do
+    backup="${base}-${n}"
+    n=$((n + 1))
+  done
+  mv "$target" "$backup" || fail "failed to move $target to backup"
+  echo "Removed $id. Backup at: $backup"
+fi
+
+# No rescan IPC on NixOS: the shell watches plugin files directly.
+
+# Drop a manually-added registry row if this add created one; generated
+# rows (builtin/external) are left alone for the next rebuild.
+if [[ -f $REGISTRY_FILE ]] && jq -e --arg id "$id" '
+  any(.[]; .id == $id and .origin == "manual")
+' "$REGISTRY_FILE" >/dev/null 2>&1; then
+  tmp=$(mktemp)
+  jq --arg id "$id" 'map(select(.id != $id))' "$REGISTRY_FILE" >"$tmp"
+  mv "$tmp" "$REGISTRY_FILE"
+fi
+
+if [[ -n $cloned_from && $was_enabled == "true" ]]; then
+  echo "Removed $id. The built-in ($cloned_from) files are untouched; re-enable it with: $(basename "$0" | sed 's/remove/enable/') $cloned_from"
+elif [[ $was_enabled == "true" ]]; then
+  echo "Plugin was enabled and was removed from the bar."
+fi

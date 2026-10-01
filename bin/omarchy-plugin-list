@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+
+# NixOS port of Omarchy's omarchy-plugin-list.
+# Origin: ./omarchy/bin/omarchy-plugin-list
+# Changes:
+# - `omarchy-shell shell listPlugins` IPC replaced by joining the sibling
+#   omarchy-plugin-catalog output (discovery) with $LAYOUT_FILE
+#   (~/.config/quickshell/plugin-layout.json, edited by
+#   omarchy-plugin-enable/disable) for enabled state. No daemon needed:
+#   PluginRegistry.qml / Bar.qml watch those files and hot-reload.
+# - Same table columns (ID/STATE/SOURCE/KINDS/NAME) and --json flag.
+
+set -euo pipefail
+
+BINDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAYOUT_FILE="${NIX_QUICKSHELL_LAYOUT_FILE:-$HOME/.config/quickshell/plugin-layout.json}"
+
+json="false"
+
+while (( $# > 0 )); do
+  case "$1" in
+  --json)
+    json="true"
+    ;;
+  -h | --help)
+    echo "Usage: omarchy plugin list [--json]"
+    exit 0
+    ;;
+  *)
+    echo "omarchy-plugin-list: unknown option: $1" >&2
+    exit 1
+    ;;
+  esac
+  shift
+done
+
+catalog=$("$BINDIR/omarchy-plugin-catalog")
+layout='{"left":[],"center":[],"right":[]}'
+if [[ -f $LAYOUT_FILE ]]; then
+  layout=$(cat "$LAYOUT_FILE")
+fi
+
+# Enabled = id appears in any bar section (same rule as
+# quickshell/scripts/plugin.sh list and PluginRegistry.qml isEnabled).
+plugins=$(jq -n --argjson catalog "$catalog" --argjson layout "$layout" '
+  ($layout.left + $layout.center + $layout.right) as $onbar
+  | $catalog
+  | map(. + {enabled: (.id as $id | $onbar | index($id) != null)})
+')
+
+if [[ $json == "true" ]]; then
+  printf '%s\n' "$plugins"
+  exit 0
+fi
+
+jq -r '
+  .[] |
+  [ .id,
+    (if .enabled then "enabled" else "disabled" end),
+    (if .firstParty then "first-party" else "third-party" end),
+    ((.kinds // []) | join(",")),
+    (.name // "")
+  ] | @tsv
+' <<<"$plugins" | awk -F '\t' '
+  BEGIN { printf "%-32s %-9s %-11s %-18s %s\n", "ID", "STATE", "SOURCE", "KINDS", "NAME" }
+  { printf "%-32s %-9s %-11s %-18s %s\n", $1, $2, $3, $4, $5 }
+'

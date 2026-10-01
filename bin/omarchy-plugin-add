@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+
+# NixOS port of Omarchy's omarchy-plugin-add (alias: omarchy plugin install).
+# Origin: ./omarchy/bin/omarchy-plugin-add
+# Changes:
+# - PLUGINS_DIR -> $NIX_QUICKSHELL_PLUGINS_DIR (default
+#   ~/.config/quickshell/plugins, the dir PluginRow.qml reads).
+# - `gum confirm/choose/input` -> plain `read` prompts (gum not packaged).
+# - `omarchy-git-url-check`, `omarchy-plugin-validate/catalog/enable` ->
+#   sibling scripts in this bin/ (BINDIR resolution, no PATH needed).
+# - `omarchy-shell shell rescanPlugins` -> no-op (file watchers reload).
+# - Discovery polling reads the sibling catalog (disk, instant) instead of
+#   `omarchy plugin list --json` IPC.
+# - After install: generates a qmldir for multi-file plugins (copied from
+#   nixos/quickshell/scripts/plugin.sh), appends an `origin == "manual"`
+#   row to $REGISTRY_FILE for immediate `list`/`enable`, and prints the
+#   declarative `plugins/default.nix` entry this clone corresponds to --
+#   adding it there + `nixos-rebuild switch` is what survives rebuilds
+#   (the manual row is regenerated away, same caveat as plugin.sh documents).
+# - The clone keeps its .git (needed by omarchy-plugin-update). Do NOT
+#   commit the plugins dir itself: a nested .git becomes a gitlink the
+#   flake evaluator cannot read (see plugin.sh's comment).
+
+set -euo pipefail
+
+BINDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}"
+
+PLUGINS_DIR="${NIX_QUICKSHELL_PLUGINS_DIR:-$HOME/.config/quickshell/plugins}"
+REGISTRY_FILE="${NIX_QUICKSHELL_REGISTRY_FILE:-$HOME/.config/quickshell/plugin-registry.json}"
+ASSUME_YES=0
+
+fail() {
+  echo "omarchy-plugin-add: $*" >&2
+  exit 1
+}
+
+interactive() {
+  [[ -t 0 && -t 1 ]]
+}
+
+confirm() {
+  local prompt="$1"
+  (( ASSUME_YES )) && return 0
+  if interactive; then
+    local answer
+    read -r -p "$prompt [y/N] " answer
+    [[ $answer == [yY] || $answer == [yY]es ]]
+  else
+    fail "refusing to continue without confirmation; pass --yes"
+  fi
+}
+
+ENABLE_PLACEMENT=()
+
+select_bar_widget_placement() {
+  local id="$1"
+  local section
+  local default_section
+  interactive || return 0
+  (( ASSUME_YES )) && return 0
+
+  jq -e '(.kinds // []) | (index("bar") | not) and (index("bar-widget") != null)' \
+    "$PLUGINS_DIR/$id/manifest.json" >/dev/null 2>&1 || return 0
+
+  default_section=$(jq -r '.barWidget.defaultSection // "center"' "$PLUGINS_DIR/$id/manifest.json")
+  echo "Place $id in which bar section?" >&2
+  echo "  1) left  2) center  3) right (default: $default_section)" >&2
+  local pick
+  read -r -p "Section [1/2/3, Enter for $default_section]: " pick || return 0
+  case "$pick" in
+    1) section="left" ;;
+    2) section="center" ;;
+    3) section="right" ;;
+    "") section="$default_section" ;;
+    left | center | right) section="$pick" ;;
+    *) return 0 ;;
+  esac
+  [[ -n $section ]] || return 0
+  ENABLE_PLACEMENT=(--section "$section")
+}
+
+plugin_id_manifest() {
+  "$BINDIR/omarchy-plugin-catalog" | jq -r --arg id "$1" '
+    map(select(.id == $id))[0].manifestPath // empty
+  '
+}
+
+url=""
+enable_after=""
+
+while (( $# > 0 )); do
+  case "$1" in
+  --enable)
+    enable_after=true
+    shift
+    ;;
+  --yes | -y)
+    ASSUME_YES=1
+    shift
+    ;;
+  -h | --help)
+    echo "Usage: omarchy plugin add [git-url] [--enable] [--yes]"
+    exit 0
+    ;;
+  -*)
+    fail "unknown add option: $1"
+    ;;
+  *)
+    [[ -z $url ]] || fail "unexpected argument: $1"
+    url="$1"
+    shift
+    ;;
+  esac
+done
+
+if [[ -z $url ]]; then
+  interactive ||
+    fail "a git URL is required (e.g. omarchy plugin add https://github.com/acme/omarchy-weather.git)"
+  read -r -p "Git URL of the plugin repo: " url || fail "cancelled"
+  [[ -n $url ]] || fail "a git URL is required"
+fi
+
+# Refuse a URL that names a git option or a transport helper before cloning, so
+# an untrusted URL cannot run a command before the plugin is validated or
+# enabled. The check is shared with omarchy-theme-install and explains itself; a
+# missing checker leaves this non-zero, which refuses the URL rather than
+# cloning it.
+"$BINDIR/omarchy-git-url-check" "$url" || exit 1
+
+if (( ! ASSUME_YES )); then
+  cat >&2 <<WARN
+
+⚠️  Plugins run as arbitrary, unsandboxed code inside your long-lived
+  omarchy-shell process. Only add repos you trust, and review the code
+  before you enable it.
+
+      URL: $url
+
+WARN
+  confirm "Clone and add this plugin?" || fail "aborted"
+fi
+
+mkdir -p "$PLUGINS_DIR"
+
+stage="$PLUGINS_DIR/.add.tmp.$$"
+rm -rf "$stage"
+if ! git clone -- "$url" "$stage"; then
+  rm -rf "$stage"
+  fail "failed to clone $url"
+fi
+
+if ! "$BINDIR/omarchy-plugin-validate" "$stage"; then
+  rm -rf "$stage"
+  fail "refusing to add: validation failed"
+fi
+
+id=$(jq -r '.id' "$stage/manifest.json")
+existing_manifest=$(plugin_id_manifest "$id") || {
+  rm -rf "$stage"
+  fail "could not inspect installed plugin ids"
+}
+if [[ -n $existing_manifest ]]; then
+  rm -rf "$stage"
+  fail "plugin id '$id' is already used by $existing_manifest"
+fi
+
+target="$PLUGINS_DIR/$id"
+if [[ -e $target || -L $target ]]; then
+  rm -rf "$stage"
+  fail "plugin '$id' is already installed; update it with: omarchy plugin update $id"
+fi
+
+mv "$stage" "$target"
+echo "Added $id into $target"
+
+# Multi-file plugins (a widget instantiating sibling files as bare types)
+# need an explicit qmldir under Quickshell's `qs:` scheme; skipped when the
+# plugin ships its own. Copied from nixos/quickshell/scripts/plugin.sh.
+if [[ ! -f $target/qmldir ]]; then
+  {
+    for f in "$target"/*.qml; do
+      [[ -e $f ]] || continue
+      base=$(basename "$f" .qml)
+      echo "$base 1.0 $(basename "$f")"
+    done
+  } >"$target/qmldir"
+fi
+
+# Immediate registry row so `list`/`enable` see the plugin without a
+# rebuild. Declarative entries (plugins/default.nix) win on rebuild;
+# see the snippet printed at the end for making this permanent.
+if [[ -f $REGISTRY_FILE ]]; then
+  kind=$(jq -r '
+    (.kinds // (if .kind then [.kind] else [] end)) as $k
+    | if ($k | index("bar-widget")) then "bar-widget" else ($k[0] // "bar-widget") end
+  ' "$target/manifest.json")
+  kinds=$(jq -c '.kinds // (if .kind then [.kind] else ["bar-widget"] end)' "$target/manifest.json")
+  name=$(jq -r '.name // $id' --arg id "$id" "$target/manifest.json")
+  tmp=$(mktemp)
+  jq --arg id "$id" --arg name "$name" --arg kind "$kind" --argjson kinds "$kinds" '
+    (map(select(.id != $id))) + [{id: $id, name: $name, kind: $kind, kinds: $kinds, origin: "manual"}]
+  ' "$REGISTRY_FILE" >"$tmp"
+  mv "$tmp" "$REGISTRY_FILE"
+fi
+
+# No rescan IPC on NixOS: the shell watches plugin files directly.
+
+if [[ -z $enable_after ]]; then
+  if (( ASSUME_YES )) || ! interactive; then
+    enable_after=false
+  elif confirm "Enable '$id' now?"; then
+    enable_after=true
+  else
+    enable_after=false
+  fi
+fi
+
+if [[ $enable_after == true ]]; then
+  select_bar_widget_placement "$id"
+  discovered=0
+  for (( attempt = 0; attempt < 40; attempt++ )); do
+    if "$BINDIR/omarchy-plugin-catalog" | jq -e --arg id "$id" 'any(.[]; .id == $id)' >/dev/null; then
+      discovered=1
+      break
+    fi
+    sleep 0.05
+  done
+  (( discovered )) || fail "plugin '$id' is not known"
+  "$BINDIR/omarchy-plugin-enable" "$id" "${ENABLE_PLACEMENT[@]}"
+else
+  echo "Enable it later with: omarchy plugin enable $id"
+fi
+
+rev=$(git -C "$target" rev-parse HEAD)
+cat <<DECL
+---
+To keep $id across rebuilds (declarative), add to nixos/plugins/default.nix:
+  "$id" = {
+    name = "$(jq -r '.name' "$target/manifest.json")";
+    src = pkgs.fetchFromGitHub {
+      owner = "<owner>"; repo = "<repo>";
+      rev = "$rev";
+      hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+      # Get the real hash, then rebuild:
+      # nix run nixpkgs#nix-prefetch-github -- <owner> <repo> --rev $rev
+    };
+  };
+DECL

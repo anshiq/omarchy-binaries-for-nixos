@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+
+# NixOS port of Omarchy's omarchy-plugin-disable.
+# Origin: ./omarchy/bin/omarchy-plugin-disable
+# Change: `omarchy-shell shell setPluginEnabled` IPC replaced by removing
+# the id from every section of $LAYOUT_FILE
+# (~/.config/quickshell/plugin-layout.json). Bar.qml hot-reloads the file.
+
+set -euo pipefail
+
+LAYOUT_FILE="${NIX_QUICKSHELL_LAYOUT_FILE:-$HOME/.config/quickshell/plugin-layout.json}"
+
+fail() {
+  echo "omarchy-plugin-disable: $*" >&2
+  exit 1
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  echo "Usage: omarchy plugin disable <id>"
+  exit 0
+fi
+
+id="${1:-}"
+[[ -n $id ]] || fail "plugin id is required"
+
+if [[ ! -f $LAYOUT_FILE ]]; then
+  fail "plugin '$id' is not known"
+fi
+
+if ! jq -e --arg id "$id" '
+  [.left, .center, .right] | add | index($id) != null
+' "$LAYOUT_FILE" >/dev/null; then
+  echo "Disabled $id (was not on the bar)"
+  exit 0
+fi
+
+tmp=$(mktemp)
+jq --arg id "$id" '
+  with_entries(.value |= map(select(. != $id)))
+' "$LAYOUT_FILE" >"$tmp"
+mv "$tmp" "$LAYOUT_FILE"
+
+echo "Disabled $id"
